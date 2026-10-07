@@ -1,0 +1,40 @@
+#!/bin/sh
+# The Befunge-98 evaluator (json2dir.b98, run by a Funge-98 interpreter such as cfunge) owns
+# UTF-8 checking, JSON parsing, validation, traversal and shell generation; this launcher
+# only moves bytes and runs the generated script.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+# Funge-98 has no stderr: on failure the evaluator prints its message to stdout and quits
+# with a non-zero code, so the captured output is shown on stderr instead of being run.
+# cfunge -S (sandbox) and -F (no fingerprints) keep the evaluator to core Funge-98.
+# The script is only run if the evaluator succeeded and wrote its end marker as the last line.
+if ! (
+  umask 077
+  "${JSON2DIR_CFUNGE:-cfunge}" -S -F "$script_dir/json2dir.b98" \
+    < "$task_tmp/input.json" > "$task_tmp/tree.sh"
+); then
+  cat -- "$task_tmp/tree.sh" >&2
+  exit 1
+fi
+if [ "$(tail -n 1 "$task_tmp/tree.sh")" != '# json2dir: end' ]; then
+  printf '%s\n' 'json2dir: the evaluator did not finish' >&2
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"

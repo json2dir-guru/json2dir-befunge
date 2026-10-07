@@ -1,0 +1,314 @@
+\ json2dir evaluator, compiled to json2dir.b98 by tools/bfasm.py.
+\ Reads the document byte by byte from stdin, checks strict UTF-8, parses and validates
+\ the whole JSON document, then prints a POSIX sh script whose last line is the marker
+\ "# json2dir: end". On error it prints "json2dir: message" (no marker) and quits with 1.
+
+var n var pos var lo var hi var poolsz var strs var strl
+var nnodes var nmem var nobj var npend var plen
+
+array IN array POOL
+array NKIND array NSTART array NLEN array NFIRST array NCOUNT   \ nodes: 0 obj 1 file 2 link 3 script
+array MNS array MNL array MVAL                                 \ members: name offset/length, value node
+array OBJMEM array PEND array PATH
+
+: readall { | c }
+  0 n!
+  begin getc dup c! -1 <> while c@ n@ IN! n@ 1 + n! repeat ;
+
+\ ---- strict UTF-8 ----
+
+: badutf fail" input is not valid UTF-8" ;
+
+\ number of continuation bytes after lead byte b; sets the range of the first one
+: u8lead { b }
+  128 lo! 191 hi!
+  b@ 128 < if 0 return then
+  b@ 194 < if badutf then
+  b@ 223 <= if 1 return then
+  b@ 224 = if 160 lo! 2 return then
+  b@ 236 <= if 2 return then
+  b@ 237 = if 159 hi! 2 return then
+  b@ 239 <= if 2 return then
+  b@ 240 = if 144 lo! 3 return then
+  b@ 243 <= if 3 return then
+  b@ 244 = if 143 hi! 3 return then
+  badutf 0 ;
+
+: checkutf8 { | i need k b }
+  0 i!
+  begin i@ n@ < while
+    i@ IN@ u8lead need!
+    i@ 1 + i!
+    0 k!
+    begin k@ need@ < while
+      i@ n@ >= if badutf then
+      i@ IN@ b!
+      b@ lo@ < if badutf then
+      b@ hi@ > if badutf then
+      128 lo! 191 hi!
+      i@ 1 + i! k@ 1 + k!
+    repeat
+  repeat ;
+
+\ ---- JSON ----
+
+: peek pos@ n@ < if pos@ IN@ else -1 then ;
+: advance pos@ 1 + pos! ;
+
+: skipws { | c }
+  begin peek c! c@ 32 = c@ 9 = or c@ 10 = or c@ 13 = or while advance repeat ;
+
+: pushpool { b } b@ poolsz@ POOL! poolsz@ 1 + poolsz! ;
+
+: hexval { c }
+  c@ '0 >= c@ '9 <= and if c@ '0 - return then
+  c@ 'a >= c@ 'f <= and if c@ 'a - 10 + return then
+  c@ 'A >= c@ 'F <= and if c@ 'A - 10 + return then
+  -1 ;
+
+: hex4 { | k v h }
+  0 v! 0 k!
+  begin k@ 4 < while
+    peek hexval h!
+    h@ 0 < if fail" invalid \u escape" then
+    v@ 16 * h@ + v! advance k@ 1 + k!
+  repeat
+  v@ ;
+
+: putcp { cp }
+  cp@ 128 < if cp@ pushpool return then
+  cp@ 2048 < if cp@ 64 / 192 + pushpool cp@ 64 % 128 + pushpool return then
+  cp@ 65536 < if
+    cp@ 4096 / 224 + pushpool cp@ 64 / 64 % 128 + pushpool cp@ 64 % 128 + pushpool return
+  then
+  cp@ 262144 / 240 + pushpool cp@ 4096 / 64 % 128 + pushpool
+  cp@ 64 / 64 % 128 + pushpool cp@ 64 % 128 + pushpool ;
+
+: escchar { c }
+  c@ 34 = if 34 return then
+  c@ 92 = if 92 return then
+  c@ 47 = if 47 return then
+  c@ 'b = if 8 return then
+  c@ 'f = if 12 return then
+  c@ 'n = if 10 return then
+  c@ 'r = if 13 return then
+  c@ 't = if 9 return then
+  fail" invalid escape in string" 0 ;
+
+: badsur fail" unpaired surrogate escape" ;
+
+\ parses a string at pos into the pool: strs/strl
+: pstring { | c cp low }
+  peek 34 <> if fail" expected a string" then
+  advance
+  poolsz@ strs!
+  begin
+    peek c!
+    c@ 0 < if fail" unterminated string" then
+    advance
+    c@ 34 <>
+  while
+    c@ 32 < if fail" control character in string" then
+    c@ 92 <> if c@ pushpool else
+      peek c! advance
+      c@ 'u = if
+        hex4 cp!
+        cp@ 56320 >= cp@ 57343 <= and if badsur then
+        cp@ 55296 >= cp@ 56319 <= and if
+          peek 92 <> if badsur then advance
+          peek 'u <> if badsur then advance
+          hex4 low!
+          low@ 56320 < low@ 57343 > or if badsur then
+          cp@ 55296 - 1024 * low@ 56320 - + 65536 + cp!
+        then
+        cp@ putcp
+      else
+        c@ escchar pushpool
+      then
+    then
+  repeat
+  poolsz@ strs@ - strl! ;
+
+: poolhas { s l b | k }
+  0 k!
+  begin k@ l@ < while
+    s@ k@ + POOL@ b@ = if 1 return then
+    k@ 1 + k!
+  repeat
+  0 ;
+
+: isdot { s l } l@ 1 = if s@ POOL@ '. = return then 0 ;
+: isdotdot { s l } l@ 2 = if s@ POOL@ '. = s@ 1 + POOL@ '. = and return then 0 ;
+: islink { s l }
+  l@ 4 = if
+    s@ POOL@ 'l = s@ 1 + POOL@ 'i = and s@ 2 + POOL@ 'n = and s@ 3 + POOL@ 'k = and return
+  then 0 ;
+: isscript { s l }
+  l@ 6 = if
+    s@ POOL@ 's = s@ 1 + POOL@ 'c = and s@ 2 + POOL@ 'r = and
+    s@ 3 + POOL@ 'i = and s@ 4 + POOL@ 'p = and s@ 5 + POOL@ 't = and return
+  then 0 ;
+
+\ <0, 0, >0 comparing the names of members a and b by their UTF-8 bytes
+: namecmp { a b | k la lb r }
+  a@ MNL@ la! b@ MNL@ lb! 0 r! 0 k!
+  begin k@ la@ < k@ lb@ < and r@ 0 = and while
+    a@ MNS@ k@ + POOL@ b@ MNS@ k@ + POOL@ - r!
+    k@ 1 + k!
+  repeat
+  r@ 0 = if la@ lb@ - r! then
+  r@ ;
+
+: newnode { kind s l }
+  kind@ nnodes@ NKIND! s@ nnodes@ NSTART! l@ nnodes@ NLEN!
+  nnodes@ dup 1 + nnodes! ;
+
+: badarray fail" an array must be [link, target] or [script, content]" ;
+
+: pvalue { depth | c node base v i j t kind ns nl more }
+  depth@ 1000 > if fail" the document is nested too deeply" then
+  skipws peek c!
+  c@ 34 = if pstring 1 strs@ strl@ newnode return then
+  c@ '[ = if
+    advance skipws
+    peek 34 <> if badarray then
+    pstring
+    0 kind!
+    strs@ strl@ islink if 2 kind! then
+    strs@ strl@ isscript if 3 kind! then
+    kind@ 0 = if badarray then
+    skipws peek ', <> if badarray then
+    advance skipws
+    peek 34 <> if badarray then
+    pstring skipws
+    peek '] <> if badarray then
+    advance
+    kind@ 2 = if
+      strs@ strl@ 0 poolhas if fail" a link target cannot contain NUL" then
+      strl@ 0 = if fail" a link target cannot be empty" then
+    then
+    kind@ strs@ strl@ newnode return
+  then
+  c@ '{ <> if fail" only objects, strings and [kind, payload] arrays are allowed" then
+  advance skipws
+  npend@ base!
+  peek '} = if advance else
+    begin
+      skipws pstring strs@ ns! strl@ nl!
+      nl@ 0 = if fail" a name cannot be empty" then
+      ns@ nl@ isdot ns@ nl@ isdotdot or if fail" a name cannot be . or .." then
+      ns@ nl@ '/ poolhas if fail" a name cannot contain /" then
+      ns@ nl@ 0 poolhas if fail" a name cannot contain NUL" then
+      skipws peek ': <> if fail" expected :" then
+      advance
+      depth@ 1 + pvalue v!
+      ns@ nmem@ MNS! nl@ nmem@ MNL! v@ nmem@ MVAL!
+      nmem@ npend@ PEND! npend@ 1 + npend!
+      nmem@ 1 + nmem!
+      skipws peek c! advance
+      0 more!
+      c@ ', = if 1 more! else c@ '} <> if fail" expected , or }" then then
+      more@ not
+    until
+  then
+  \ stable insertion sort of this object's members by name bytes
+  base@ 1 + i!
+  begin i@ npend@ < while
+    i@ PEND@ t! i@ 1 - j!
+    begin j@ base@ >= if j@ PEND@ t@ namecmp 0 > else 0 then while
+      j@ PEND@ j@ 1 + PEND! j@ 1 - j!
+    repeat
+    t@ j@ 1 + PEND!
+    i@ 1 + i!
+  repeat
+  0 0 0 newnode node!
+  nobj@ node@ NFIRST! npend@ base@ - node@ NCOUNT!
+  base@ i!
+  begin i@ npend@ < while i@ PEND@ nobj@ OBJMEM! nobj@ 1 + nobj! i@ 1 + i! repeat
+  base@ npend!
+  node@ ;
+
+\ ---- shell output ----
+
+: quote1 { b } b@ 39 = if 39 emit 92 emit 39 emit 39 emit else b@ emit then ;
+
+\ single-quoted shell word; NUL bytes split the payload into separate words
+: qword { s l | k b }
+  39 emit 0 k!
+  begin k@ l@ < while
+    s@ k@ + POOL@ b!
+    b@ 0 = if 39 emit 32 emit 39 emit else b@ quote1 then
+    k@ 1 + k!
+  repeat
+  39 emit ;
+
+: qpath { | k }
+  39 emit 0 k!
+  begin k@ plen@ < while k@ PATH@ quote1 k@ 1 + k! repeat
+  39 emit ;
+
+: emitobj { node | i m v k pl cnt first kind }
+  node@ NCOUNT@ cnt! node@ NFIRST@ first!
+  0 i!
+  begin i@ cnt@ < while
+    first@ i@ + OBJMEM@ m!
+    \ duplicate names: the last occurrence wins (the sort is stable)
+    i@ 1 + cnt@ < if m@ first@ i@ + 1 + OBJMEM@ namecmp 0 = else 0 then
+    not if
+      m@ MVAL@ v! plen@ pl! v@ NKIND@ kind!
+      pl@ 0 > if '/ plen@ PATH! plen@ 1 + plen! then
+      0 k!
+      begin k@ m@ MNL@ < while m@ MNS@ k@ + POOL@ plen@ PATH! plen@ 1 + plen! k@ 1 + k! repeat
+      kind@ 0 = if
+        ." _j2d_dir " qpath 10 emit v@ emitobj
+      else
+        kind@ 1 = if ." _j2d_file " then
+        kind@ 2 = if ." _j2d_link " then
+        kind@ 3 = if ." _j2d_script " then
+        qpath 32 emit v@ NSTART@ v@ NLEN@ qword 10 emit
+      then
+      pl@ plen!
+    then
+    i@ 1 + i!
+  repeat ;
+
+: helpers
+  ." set -eu\n"
+  ." _j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n"
+  ." # Remove an existing non-directory (a symlink itself, never its target);\n"
+  ." # a real directory in the way of a non-object is an error.\n"
+  ." _j2d_clear() {\n"
+  ."   if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  ."   elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n"
+  ."   elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  ."   fi\n"
+  ." }\n"
+  ." _j2d_dir() {\n"
+  ."   if [ -L \"$1\" ] || { [ -e \"$1\" ] && [ ! -d \"$1\" ]; }; then rm -f -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+  ."   if [ ! -d \"$1\" ]; then mkdir -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+  ." }\n"
+  ." # _j2d_file path part...: the content is the parts joined by NUL bytes.\n"
+  ." _j2d_file() {\n"
+  ."   _j2d_clear \"$1\"\n"
+  ."   _j2d_path=$1; shift\n"
+  ."   {\n"
+  ."     printf '%s' \"$1\"; shift\n"
+  ."     for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n"
+  ."   } > \"$_j2d_path\" || _j2d_fail \"$_j2d_path\"\n"
+  ." }\n"
+  ." _j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$1\" || _j2d_fail \"$1\"; }\n"
+  ." _j2d_link() { _j2d_clear \"$1\"; ln -s -- \"$2\" \"$1\" || _j2d_fail \"$1\"; }\n" ;
+
+: main { | root }
+  readall
+  checkutf8
+  0 pos!
+  \ a leading byte order mark is ignored
+  n@ 3 >= if 0 IN@ 239 = 1 IN@ 187 = and 2 IN@ 191 = and if 3 pos! then then
+  skipws peek '{ <> if fail" the root of the document must be an object" then
+  0 pvalue root!
+  skipws pos@ n@ < if fail" trailing data after the JSON value" then
+  helpers
+  0 plen! root@ emitobj
+  ." # json2dir: end\n"
+  0 exit ;
